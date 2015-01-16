@@ -3637,7 +3637,8 @@ begin
             'pagos mensuales ib: '+FloatToStr(pagosMensualesIB)+#13+
             'hit: '+textoHit+#13+
             'riesgo: '+FloatToStr(riesgo)+#13+
-            'financiero: '+FloatToStr(financiero)
+            'financiero: '+FloatToStr(financiero)+#13+
+            'resultado: '+resultado
             , mtInformation, [mbOK], 0);
     end;
 end;
@@ -3870,7 +3871,7 @@ begin
     fgResumen.Enabled :=
         ((cmbStatus2.Text = 'AUTORIZADO') and (lbStatus.Caption <> 'RECHAZADO')) or
         (iNivel > 1);
-    cmbStatus2.ItemIndex := cmbStatus2.Items.IndexOf(query.fieldbyname('resultado').AsString);
+    cmbStatus2.ItemIndex := cmbStatus2.Items.IndexOf(resultado);
     cmbStatus2.Enabled := iNivel > 3; //Solo Niveles > a 3
     cmdAplicar.Enabled :=
         (lbStatus.Caption = 'ACTIVADO') or
