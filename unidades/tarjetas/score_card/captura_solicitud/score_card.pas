@@ -561,7 +561,13 @@ type
     procedure carga_datos_fiador(CuentaF : String);
     procedure actualiza_datos_anteriores;
     procedure almacena_fecha_pago(sCuenta : string; sStatus : string);
-    procedure calcula_puntaje(n : integer; quien : TObject);
+    procedure calcula_puntaje(
+            n : integer;
+            quien : TObject;
+            score : Integer = 0;
+            capacidadPago : Double = 0;
+            montoMaximo : Double = 0;
+            resultado : String = '');
     procedure CapturaError(Sender: TObject; E: Exception);
 
     function puntaje_aval : Integer;
@@ -1182,7 +1188,6 @@ begin
 
             sCtaOrigen := 'T'+Copy(dmModulo_datos.msqTemporal.fieldbyname('cuenta_origen').AsString,0,3);
             carga_informacion(msqTemporal.FieldByName('clave_cuenta').AsString);
-            calcula_puntaje(2,nil);
             btnConsultaBuro.Enabled := iNivel >= 3;
             fgResumen.Enabled := False;
             verificarConsultasExitosasPreviasBuroCredito();
@@ -2786,25 +2791,6 @@ begin
     end;
 end;
 
-procedure TfrmScoreCard.llena_lineas(cap_pag, minimo, maximo: Currency);
-begin
-   msqPlazos.Sql.Text:='select plazo_tope from mueblerias where clave_muebleria="'+frmMain.sClave_muebleria+'" ';
-   msqPlazos.Open;
-   plazo_tope:=msqPlazos.fieldbyname('plazo_tope').AsInteger;
-   msqPlazos.Sql.Text:='SELECT meses FROM pcredito where meses>3 and meses<='+inttostr(plazo_tope)+' group by meses ';
-   msqPlazos.Open;
-   mdLineas.EmptyTable;
-   while not msqPlazos.Eof do begin
-     mdLineas.Append;
-     mdLineas['plazo'] :=msqPlazos.fieldbyname('meses').AsString+ ' Meses';
-     if (msqPlazos.fieldbyname('meses').AsInteger * cap_pag) < maximo then
-       mdLineas['linea_cred'] := msqPlazos.fieldbyname('meses').AsInteger * cap_pag
-     else
-       mdLineas['linea_cred'] := Maximo;
-     mdLineas.Post;
-     msqPlazos.Next;
-   end;
-end;
 
 procedure TfrmScoreCard.cmdAplicarClick(Sender: TObject);
 var
@@ -3228,7 +3214,442 @@ begin
     calcula_puntaje(2,Sender);
 end;
 
-procedure TfrmScoreCard.calcula_puntaje(n: Integer; quien : TObject);
+
+procedure TfrmScoreCard.verificarConsultasExitosasPreviasBuroCredito();
+var
+claveCuenta : String;
+version : String;
+score : Integer;
+edad : Integer;
+montoMaximo : Double;
+resultado : String;
+tasaInteresAnual : Double;
+porcentajeIngresoMensual : Double;
+riesgo : Double;
+financiero : Double;
+capacidadPago : Double;
+ingresoMensual : Double;
+pagosMensualesIB : Double;
+hit : Boolean;
+textoHit : String;
+sucursal : String;
+    function obtenerVersion(cuenta : String; query : TZMySqlquery): String;
+    begin
+        query.Sql.Text :=
+            'SELECT MAX(version) AS version '+
+            'FROM EVALUA_segmento_PN '+
+            'WHERE clave_cuenta = "'+cuenta+'"';
+        query.Open();
+        result := query.FieldByName('version').AsString;
+    end;
+    function obtenerSucursal(cuenta : String; query : TZMySqlquery): String;
+    begin
+        query.Sql.Text :=
+            'SELECT CONCAT("T",LEFT(cuenta_origen,3)) AS sucursal '+
+            'FROM corporativo.cuentas '+
+            'WHERE clave_cuenta = "'+Trim(cuenta)+'"';
+        query.Open();
+        result := query.FieldByName('sucursal').AsString;
+    end;
+    procedure negativoObtenerMontoYResultado(suc : String; edad : Integer; var monto : Double; var resul : String; query : TZMySqlquery);
+    begin
+        query.Sql.Text :=
+            'SELECT '+
+                    'monto_maximo,'+
+                    'resultado '+
+            'FROM EVALUA_reglas_capacidad '+
+            'WHERE '+
+                    'tipo_regla = "EDAD" AND '+
+                    'param1 = "'+IntToStr(edad)+'" AND '+
+                    'sucursal = "'+suc+'"';
+        query.Open();
+        if not query.IsEmpty() then begin
+            monto := query.FieldByName('monto_maximo').AsFloat;
+            resul := query.FieldByName('resultado').AsString;
+            Exit;
+        end;
+
+        query.Sql.Text :=
+            'SELECT '+
+                    'monto_maximo,'+
+                    'resultado '+
+            'FROM EVALUA_reglas_capacidad '+
+            'WHERE '+
+                    'tipo_regla = "EDAD" AND '+
+                    'param1 = "'+IntToStr(edad)+'" AND '+
+                    'sucursal = "*"';
+        query.Open();
+        if not query.IsEmpty() then begin
+            monto := query.FieldByName('monto_maximo').AsFloat;
+            resul := query.FieldByName('resultado').AsString;
+            Exit;
+        end;
+
+        monto := 0;
+        resul := 'RECHAZADO';
+    end;
+    procedure rangoObtenerMontoYResultado(suc : String; sc : Integer; var monto : Double; var resul : String; query : TZMySqlquery);
+    var
+    i : String; // inicio
+    t : String; // termino
+    begin
+        query.Sql.Text := // Buscar reglas para la sucursal
+            'SELECT '+
+                    'CAST(param1 AS SIGNED) AS _param1,'+
+                    'param1,'+
+                    'param2,'+
+                    'monto_maximo,'+
+                    'resultado '+
+            'FROM EVALUA_reglas_capacidad '+
+            'WHERE '+
+                    'tipo_regla = "RANGO" AND '+
+                    'sucursal = "'+suc+'" '+
+            'ORDER BY _param1 ASC';
+        query.Open();
+        while not query.Eof do begin
+            i := Trim(query.FieldByName('param1').AsString);
+            t := Trim(query.FieldByName('param2').AsString);
+            if (i = '') and (t <> '') then begin // termino
+                if sc < StrToInt(t) then begin
+                    monto := query.FieldByName('monto_maximo').AsFloat;
+                    resul := query.FieldByName('resultado').AsString;
+                    Exit;
+                end;
+            end else if (i <> '') and (t = '') then begin // inicio
+                if sc > StrToInt(i) then begin
+                    monto := query.FieldByName('monto_maximo').AsFloat;
+                    resul := query.FieldByName('resultado').AsString;
+                    Exit;
+                end;
+            end else if (i <> '') and (t <> '') then begin // inicio y termino
+                if (sc >= StrToInt(i)) and (sc <= StrToInt(t)) then begin
+                    monto := query.FieldByName('monto_maximo').AsFloat;
+                    resul := query.FieldByName('resultado').AsString;
+                    Exit;
+                end;
+            end;
+            query.Next();
+        end;
+
+        query.Sql.Text := // Buscar reglas generales
+            'SELECT '+
+                    'CAST(param1 AS SIGNED) AS _param1,'+
+                    'param1,'+
+                    'param2,'+
+                    'monto_maximo,'+
+                    'resultado '+
+            'FROM EVALUA_reglas_capacidad '+
+            'WHERE '+
+                    'tipo_regla = "RANGO" AND '+
+                    'sucursal = "*" '+
+            'ORDER BY _param1 ASC';
+        query.Open();
+        while not query.Eof do begin
+            i := Trim(query.FieldByName('param1').AsString);
+            t := Trim(query.FieldByName('param2').AsString);
+            if (i = '') and (t <> '') then begin // termino
+                if sc < StrToInt(t) then begin
+                    monto := query.FieldByName('monto_maximo').AsFloat;
+                    resul := query.FieldByName('resultado').AsString;
+                    Exit;
+                end;
+            end else if (i <> '') and (t = '') then begin // inicio
+                if sc > StrToInt(i) then begin
+                    monto := query.FieldByName('monto_maximo').AsFloat;
+                    resul := query.FieldByName('resultado').AsString;
+                    Exit;
+                end;
+            end else if (i <> '') and (t <> '') then begin // inicio y termino
+                if (sc >= StrToInt(i)) and (sc <= StrToInt(t)) then begin
+                    monto := query.FieldByName('monto_maximo').AsFloat;
+                    resul := query.FieldByName('resultado').AsString;
+                    Exit;
+                end;
+            end;
+            query.Next();
+        end;
+
+        // Caso default
+        monto := 0;
+        resul := 'RECHAZADO';
+    end;
+    procedure mostrarCapacidadDePago(cap : Double; res : String; sc : Integer);
+    begin
+        ceCap_Pag_Quin.Value := cap;
+        if cap < 0 then
+            ceCap_Pag_Men.Value := cap
+        else
+            ceCap_Pag_Men.Value := cap * 2;
+
+        cmbStatus2.ItemIndex := cmbStatus2.Items.IndexOf(res);
+        lbCalificacion.Caption := IntToStr(sc) + ' Pts.';
+    end;
+    function obtenerIngresoMensual() : Double;
+    begin
+        result := txtSueldo_cliente.Value;
+    end;
+    function obtenerScore(cuenta : String; ver : String; query : TZMySqlQuery): Integer;
+    var
+    tmp : String;
+    begin
+        query.Sql.Text :=
+            'SELECT SC01 AS valor '+
+            'FROM EVALUA_segmento_SC '+
+            'WHERE '+
+                    'clave_cuenta = "'+cuenta+'" AND '+
+                    'version = "'+ver+'"';
+        query.Open();
+        tmp := Trim(query.FieldByName('valor').AsString);
+        try
+            result := StrToInt(tmp);
+        except
+            result := -1;
+        end;
+    end;
+    function obtenerPorcentajeIngresoMensual(suc : String; query : TZMySqlQuery) : Double;
+    begin
+        query.Sql.Text :=
+            'SELECT param1 '+
+            'FROM EVALUA_reglas_capacidad '+
+            'WHERE '+
+                    'tipo_regla = "INGRESO_MENSUAL" AND '+
+                    'sucursal = "'+suc+'"';
+        query.Open();
+        if not query.IsEmpty() then begin
+            result := query.FieldByName('param1').AsFloat/100;
+            Exit;
+        end;
+
+        query.Sql.Text :=
+            'SELECT param1 '+
+            'FROM EVALUA_reglas_capacidad '+
+            'WHERE '+
+                    'tipo_regla = "INGRESO_MENSUAL" AND '+
+                    'sucursal = "*"';
+        query.Open();
+        if not query.IsEmpty() then begin
+            result := query.FieldByName('param1').AsFloat/100;
+            Exit;
+        end;
+
+        result := 0.30;
+    end;
+    function obtenerTasaInteresAnualizada(suc : String; query : TZMySqlQuery) : Double;
+    begin
+        query.Sql.Text :=
+            'SELECT param1 '+
+            'FROM EVALUA_reglas_capacidad '+
+            'WHERE '+
+                    'tipo_regla = "TASA_INTERES" AND '+
+                    'sucursal = "'+suc+'"';
+        query.Open();
+        if not query.IsEmpty() then begin
+            result := query.FieldByName('param1').AsFloat/100;
+            Exit;
+        end;
+
+        query.Sql.Text :=
+            'SELECT param1 '+
+            'FROM EVALUA_reglas_capacidad '+
+            'WHERE '+
+                    'tipo_regla = "TASA_INTERES" AND '+
+                    'sucursal = "*"';
+        query.Open();
+        if not query.IsEmpty() then begin
+            result := query.FieldByName('param1').AsFloat/100;
+            Exit;
+        end;
+
+        result := 0.60;
+    end;
+    function obtenerEdad(fechaActual : TDate): Integer;
+    begin
+        result := YearsBetween(fechaActual,deNacimiento_Cliente.Date);
+    end;
+    function tieneHit(cuenta : String; ver : String; query : TZMySqlQuery): Boolean;
+    begin
+        query.Sql.Text :=
+            'SELECT COUNT(clave_cuenta) AS cantidad '+
+            'FROM EVALUA_segmento_TL '+
+            'WHERE '+
+                    'clave_cuenta = "'+cuenta+'" AND '+
+                    'version = "'+ver+'"';
+        query.Open();
+        result := query.FieldByName('cantidad').AsInteger > 0;
+    end;
+    function obtenerPagosMensuales(cuenta : String; ver : String; query : TZMySqlQuery): Double;
+    var
+    totalPagos : Double;
+    frecPago : String;
+    montoPagar : Double;
+    saldoActual : Double;
+    tmp : String;
+    begin
+        totalPagos := 0;
+        query.Sql.Text :=
+            'SELECT '+
+                    'TL22 AS saldo_actual,'+
+                    'TL12 AS monto_pagar,'+
+                    'TL11 AS frecuencia_pagos '+
+            'FROM EVALUA_segmento_TL '+
+            'WHERE '+
+                    'clave_cuenta = "'+cuenta+'" AND '+
+                    'version = "'+ver+'"';
+        query.Open();
+        while not query.Eof do begin
+            tmp := Trim(query.FieldByName('saldo_actual').AsString);
+            if tmp = '' then begin
+                saldoActual := 0
+            end else begin
+                tmp := StringReplace(tmp,'$','',[rfReplaceAll]);
+                tmp := StringReplace(tmp,'+','',[rfReplaceAll]);
+                saldoActual := StrToInt(tmp);
+            end;
+            if saldoActual <= 0 then begin
+                query.Next();
+                Continue;
+            end;
+            montoPagar := query.FieldByName('monto_pagar').AsFloat;
+            frecPago := Trim(query.FieldByName('frecuencia_pagos').AsString);
+            if frecPago = 'B' then begin //BIMESTRAL
+                montoPagar := montoPagar / 2;
+            end else if frecPago = 'D' then begin //DIARIO
+                montoPagar := montoPagar * 30.4;
+            end else if frecPago = 'H' then begin //SEMESTRAL
+                montoPagar := montoPagar / 6;
+            end else if frecPago = 'K' then begin //CATORCENAL
+                montoPagar := (montoPagar/28) * 30.4;
+            end else if frecPago = 'M' then begin //MENSUAL
+                montoPagar := montoPagar;
+            end else if frecPago = 'P' then begin //DEDUCCION DEL SALARIO
+                MessageDlg(
+                    'SE HA DETECTADO UNA CUENTA CON FORMA DE PAGO:'+#13+
+                    '"P" (DEDUCCIÓN DEL SALARIO), SE IGNORARÁ EN EL CÁLCULO', mtWarning, [mbOK], 0);
+                query.Next();
+                Continue;
+            end else if frecPago = 'Q' then begin //TRIMESTRAL
+                montoPagar := montoPagar / 3;
+            end else if frecPago = 'S' then begin //QUINCENAL
+                montoPagar := montoPagar * 2;
+            end else if frecPago = 'V' then begin //VARIABLE
+                MessageDlg(
+                    'SE HA DETECTADO UNA CUENTA CON FORMA DE PAGO:'+#13+
+                    '"V" (VARIABLE), SE IGNORARÁ EN EL CÁLCULO', mtWarning, [mbOK], 0);
+                query.Next();
+                Continue;
+            end else if frecPago = 'W' then begin //SEMANAL
+                montoPagar := (montoPagar/7) * 30.4;
+            end else if frecPago = 'Y' then begin //ANUAL
+                montoPagar := montoPagar/12;
+            end else if frecPago = 'Z' then begin //PAGO MINIMO PARA CUENTAS REVOLVENTES
+                MessageDlg(
+                    'SE HA DETECTADO UNA CUENTA CON FORMA DE PAGO:'+#13+
+                    '"Z" (PAGO MÍNIMO), SE IGNORARÁ EN EL CÁLCULO', mtWarning, [mbOK], 0);
+                query.Next();
+                Continue;
+            end;
+
+            if saldoActual < montoPagar then
+                totalPagos := totalPagos + saldoActual
+            else
+                totalPagos := totalPagos + montoPagar;
+            query.Next();
+        end;
+        result := totalPagos;
+    end;
+begin
+    claveCuenta := Trim(txtClave_Cuenta.Text);
+    // Verificar si se han realizado consultas previas al buro de
+    // credito (los resultados de estas consultas se almacenan en las
+    // tablas que inician con "EVALUA_"
+    dmModulo_datos.msqTemporal.Sql.Text :=
+        'SELECT clave_cuenta '+
+        'FROM corporativo.EVALUA_segmento_PN '+
+        'WHERE clave_cuenta = "'+claveCuenta+'"';
+    dmModulo_datos.msqTemporal.Open();
+    if dmModulo_datos.msqTemporal.IsEmpty() then begin
+        ButtonResultadoBuro.Enabled := False;
+        ButtonRecalcular.Enabled := True;
+    end else begin
+        ButtonResultadoBuro.Enabled := True;
+
+        sucursal := obtenerSucursal(claveCuenta, dmModulo_datos.msqTemporal);
+        tasaInteresAnual := obtenerTasaInteresAnualizada(sucursal, dmModulo_datos.msqTemporal);
+        porcentajeIngresoMensual := obtenerPorcentajeIngresoMensual(sucursal, dmModulo_datos.msqTemporal);
+        ingresoMensual := obtenerIngresoMensual();
+        edad := obtenerEdad(frmMain.dFecha_server);
+
+        version := obtenerVersion(claveCuenta, dmModulo_datos.msqTemporal);
+        score := obtenerScore(claveCuenta, version, dmModulo_datos.msqTemporal);
+
+        // por lo general la variable "pagoMensualDeCliente" contiene el valor
+        // -1, a menos que se haya especificado un monto diferente utilizando
+        // para ello el boton ButtonRecalcular (Re-calcular)
+        if pagoMensualDeCliente = -1 then
+            pagosMensualesIB := obtenerPagosMensuales(claveCuenta, version, dmModulo_datos.msqTemporal)
+        else
+            pagosMensualesIB := pagoMensualDeCliente;
+        hit := tieneHit(claveCuenta, version, dmModulo_datos.msqTemporal);
+
+        montoMaximo := 0;
+        resultado := '';
+
+        if score < 0 then begin
+            if hit or (edad > 22) then begin
+                negativoObtenerMontoYResultado(sucursal, 22, montoMaximo, resultado, dmModulo_datos.msqTemporal)
+            end else if hit and (edad < 23) then begin
+                negativoObtenerMontoYResultado(sucursal, 23, montoMaximo, resultado, dmModulo_datos.msqTemporal)
+            end;
+        end else begin
+            rangoObtenerMontoYResultado(sucursal, score, montoMaximo, resultado, dmModulo_datos.msqTemporal);
+        end;
+
+        riesgo := (montoMaximo*(1+tasaInteresAnual))/24;
+        financiero := ((ingresoMensual*porcentajeIngresoMensual) - pagosMensualesIB)/2;
+
+        if riesgo < financiero then
+            capacidadPago := riesgo
+        else
+            capacidadPago := financiero;
+
+        if capacidadPago <= 0 then
+            resultado := 'RECHAZADO';
+
+
+        calcula_puntaje(2, Nil, score, capacidadPago, montoMaximo, resultado);
+
+        //mostrarCapacidadDePago(capacidadPago, resultado, score);
+        //fgResumen.Enabled := iNivel >= 3;
+
+        ButtonRecalcular.Enabled := True;
+
+        if hit then
+            textoHit := 'Si'
+        else
+            textoHit := 'No';
+        MessageDlg(
+            'VENTANA PARA VALIDACION DE MODULO'+#13+#13+
+            'tasa de interes anual: '+FloatToStr(tasaInteresAnual)+#13+
+            'porcentaje de ingreso mensual: '+FloattoStr(porcentajeIngresoMensual)+#13+
+            'score: '+IntToStr(score)+#13+
+            'edad: '+IntToStr(edad)+#13+
+            'ingreso mensual: '+FloatToStr(ingresoMensual)+#13+
+            'pagos mensuales ib: '+FloatToStr(pagosMensualesIB)+#13+
+            'hit: '+textoHit+#13+
+            'riesgo: '+FloatToStr(riesgo)+#13+
+            'financiero: '+FloatToStr(financiero)
+            , mtInformation, [mbOK], 0);
+    end;
+end;
+
+
+procedure TfrmScoreCard.calcula_puntaje(
+        n: Integer;
+        quien : TObject;
+        score : Integer = 0;
+        capacidadPago : Double = 0;
+        montoMaximo : Double = 0;
+        resultado : String = '');
 var
 ptelefonos : Integer;
 preferencias : Integer;
@@ -3365,7 +3786,7 @@ begin
             Exit;
     end;
 
-    sql :=
+    {sql :=
         'SELECT sum(pe.calificacion + pap.calificacion + pibm.calificacion + '+
         'pat.calificacion + pec.calificacion + pad.calificacion + '+
         'ppr.calificacion + ((pibm.calificacion - pibm.base) * '+
@@ -3425,6 +3846,23 @@ begin
         end;
         ftMaximo := query.fieldbyname('tMaximo').AsCurrency;
         ftGarantia := query.fieldbyname('tGarantia').AsCurrency;
+    end;}
+
+    ftMaximo := montoMaximo;
+    ftGarantia := 8000;
+    if capacidadPago >= 0 then begin
+        ceCap_Pag_Men.Value := capacidadPago * 2;
+        ceCap_Pag_Quin.Value := capacidadPago;
+        try
+            cap_pago_p.Caption := FloatToStr(RoundTo(
+                (ceCap_Pag_Men.Value / txtSueldo_Cliente.Value) * 100,-2)) + '%';
+        except
+            cap_pago_p.Caption := '0';
+        end;
+    end else begin
+        ceCap_Pag_Men.Value := 0;
+        ceCap_Pag_Quin.Value := 0;
+        cap_pago_p.Caption := '0';
     end;
 
     llena_lineas(ceCap_Pag_Men.Value, ftGarantia, ftMaximo);
@@ -3553,6 +3991,38 @@ begin
                 query.ExecSql();
             end;
         end;
+    end;
+end;
+
+procedure TfrmScoreCard.llena_lineas(cap_pag, minimo, maximo: Currency);
+begin
+    msqPlazos.Sql.Text :=
+        'SELECT plazo_tope '+
+        'FROM mueblerias '+
+        'WHERE clave_muebleria = "'+frmMain.sClave_muebleria+'"';
+    msqPlazos.Open();
+    plazo_tope := msqPlazos.fieldbyname('plazo_tope').AsInteger;
+
+    mdLineas.EmptyTable();
+    msqPlazos.Sql.Text :=
+        'SELECT meses '+
+        'FROM pcredito '+
+        'WHERE '+
+                'meses > 3 AND '+
+                'meses <= '+IntToStr(plazo_tope)+' '+
+        'GROUP BY meses';
+    msqPlazos.Open();
+    while not msqPlazos.Eof do begin
+        mdLineas.Append;
+        mdLineas['plazo'] := msqPlazos.FieldByName('meses').AsString+ ' Meses';
+
+        if (msqPlazos.FieldByName('meses').AsInteger * cap_pag) < maximo then
+            mdLineas['linea_cred'] := msqPlazos.FieldByName('meses').AsInteger * cap_pag
+        else
+            mdLineas['linea_cred'] := Maximo;
+            
+        mdLineas.Post();
+        msqPlazos.Next();
     end;
 end;
 
@@ -6649,430 +7119,7 @@ begin
     verificarConsultasExitosasPreviasBuroCredito();
 end;
 
-procedure TfrmScoreCard.verificarConsultasExitosasPreviasBuroCredito();
-var
-claveCuenta : String;
-version : String;
-score : Integer;
-edad : Integer;
-montoMaximo : Double;
-resultado : String;
-tasaInteresAnual : Double;
-porcentajeIngresoMensual : Double;
-riesgo : Double;
-financiero : Double;
-capacidadPago : Double;
-ingresoMensual : Double;
-pagosMensualesIB : Double;
-hit : Boolean;
-textoHit : String;
-sucursal : String;
-    function obtenerVersion(cuenta : String; query : TZMySqlquery): String;
-    begin
-        query.Sql.Text :=
-            'SELECT MAX(version) AS version '+
-            'FROM EVALUA_segmento_PN '+
-            'WHERE clave_cuenta = "'+cuenta+'"';
-        query.Open();
-        result := query.FieldByName('version').AsString;
-    end;
-    function obtenerSucursal(cuenta : String; query : TZMySqlquery): String;
-    begin
-        query.Sql.Text :=
-            'SELECT CONCAT("T",LEFT(cuenta_origen,3)) AS sucursal '+
-            'FROM corporativo.cuentas '+
-            'WHERE clave_cuenta = "'+Trim(cuenta)+'"';
-        query.Open();
-        result := query.FieldByName('sucursal').AsString;
-    end;
-    procedure negativoObtenerMontoYResultado(suc : String; edad : Integer; var monto : Double; var resul : String; query : TZMySqlquery);
-    begin
-        query.Sql.Text :=
-            'SELECT '+
-                    'monto_maximo,'+
-                    'resultado '+
-            'FROM EVALUA_reglas_capacidad '+
-            'WHERE '+
-                    'tipo_regla = "EDAD" AND '+
-                    'param1 = "'+IntToStr(edad)+'" AND '+
-                    'sucursal = "'+suc+'"';
-        query.Open();
-        if not query.IsEmpty() then begin
-            monto := query.FieldByName('monto_maximo').AsFloat;
-            resul := query.FieldByName('resultado').AsString;
-            Exit;
-        end;
 
-        query.Sql.Text :=
-            'SELECT '+
-                    'monto_maximo,'+
-                    'resultado '+
-            'FROM EVALUA_reglas_capacidad '+
-            'WHERE '+
-                    'tipo_regla = "EDAD" AND '+
-                    'param1 = "'+IntToStr(edad)+'" AND '+
-                    'sucursal = "*"';
-        query.Open();
-        if not query.IsEmpty() then begin
-            monto := query.FieldByName('monto_maximo').AsFloat;
-            resul := query.FieldByName('resultado').AsString;
-            Exit;
-        end;
-
-        monto := 0;
-        resul := 'RECHAZADO';
-    end;
-    procedure rangoObtenerMontoYResultado(suc : String; sc : Integer; var monto : Double; var resul : String; query : TZMySqlquery);
-    var
-    i : String; // inicio
-    t : String; // termino
-    begin
-        query.Sql.Text := // Buscar reglas para la sucursal
-            'SELECT '+
-                    'CAST(param1 AS SIGNED) AS _param1,'+
-                    'param1,'+
-                    'param2,'+
-                    'monto_maximo,'+
-                    'resultado '+
-            'FROM EVALUA_reglas_capacidad '+
-            'WHERE '+
-                    'tipo_regla = "RANGO" AND '+
-                    'sucursal = "'+suc+'" '+
-            'ORDER BY _param1 ASC';
-        query.Open();
-        while not query.Eof do begin
-            i := Trim(query.FieldByName('param1').AsString);
-            t := Trim(query.FieldByName('param2').AsString);
-            if (i = '') and (t <> '') then begin // termino
-                if sc < StrToInt(t) then begin
-                    monto := query.FieldByName('monto_maximo').AsFloat;
-                    resul := query.FieldByName('resultado').AsString;
-                    Exit;
-                end;
-            end else if (i <> '') and (t = '') then begin // inicio
-                if sc > StrToInt(i) then begin
-                    monto := query.FieldByName('monto_maximo').AsFloat;
-                    resul := query.FieldByName('resultado').AsString;
-                    Exit;
-                end;
-            end else if (i <> '') and (t <> '') then begin // inicio y termino
-                if (sc >= StrToInt(i)) and (sc <= StrToInt(t)) then begin
-                    monto := query.FieldByName('monto_maximo').AsFloat;
-                    resul := query.FieldByName('resultado').AsString;
-                    Exit;
-                end;
-            end;
-            query.Next();
-        end;
-
-        query.Sql.Text := // Buscar reglas generales
-            'SELECT '+
-                    'CAST(param1 AS SIGNED) AS _param1,'+
-                    'param1,'+
-                    'param2,'+
-                    'monto_maximo,'+
-                    'resultado '+
-            'FROM EVALUA_reglas_capacidad '+
-            'WHERE '+
-                    'tipo_regla = "RANGO" AND '+
-                    'sucursal = "*" '+
-            'ORDER BY _param1 ASC';
-        query.Open();
-        while not query.Eof do begin
-            i := Trim(query.FieldByName('param1').AsString);
-            t := Trim(query.FieldByName('param2').AsString);
-            if (i = '') and (t <> '') then begin // termino
-                if sc < StrToInt(t) then begin
-                    monto := query.FieldByName('monto_maximo').AsFloat;
-                    resul := query.FieldByName('resultado').AsString;
-                    Exit;
-                end;
-            end else if (i <> '') and (t = '') then begin // inicio
-                if sc > StrToInt(i) then begin
-                    monto := query.FieldByName('monto_maximo').AsFloat;
-                    resul := query.FieldByName('resultado').AsString;
-                    Exit;
-                end;
-            end else if (i <> '') and (t <> '') then begin // inicio y termino
-                if (sc >= StrToInt(i)) and (sc <= StrToInt(t)) then begin
-                    monto := query.FieldByName('monto_maximo').AsFloat;
-                    resul := query.FieldByName('resultado').AsString;
-                    Exit;
-                end;
-            end;
-            query.Next();
-        end;
-
-        // Caso default
-        monto := 0;
-        resul := 'RECHAZADO';
-    end;
-    procedure mostrarCapacidadDePago(cap : Double; res : String; sc : Integer);
-    begin
-        ceCap_Pag_Quin.Value := cap;
-        if cap < 0 then
-            ceCap_Pag_Men.Value := cap
-        else
-            ceCap_Pag_Men.Value := cap * 2;
-
-        cmbStatus2.ItemIndex := cmbStatus2.Items.IndexOf(res);
-        lbCalificacion.Caption := IntToStr(sc) + ' Pts.';
-    end;
-    function obtenerIngresoMensual() : Double;
-    begin
-        result := txtSueldo_cliente.Value;
-    end;
-    function obtenerScore(cuenta : String; ver : String; query : TZMySqlQuery): Integer;
-    var
-    tmp : String;
-    begin
-        query.Sql.Text :=
-            'SELECT SC01 AS valor '+
-            'FROM EVALUA_segmento_SC '+
-            'WHERE '+
-                    'clave_cuenta = "'+cuenta+'" AND '+
-                    'version = "'+ver+'"';
-        query.Open();
-        tmp := Trim(query.FieldByName('valor').AsString);
-        try
-            result := StrToInt(tmp);
-        except
-            result := -1;
-        end;
-    end;
-    function obtenerPorcentajeIngresoMensual(suc : String; query : TZMySqlQuery) : Double;
-    begin
-        query.Sql.Text :=
-            'SELECT param1 '+
-            'FROM EVALUA_reglas_capacidad '+
-            'WHERE '+
-                    'tipo_regla = "INGRESO_MENSUAL" AND '+
-                    'sucursal = "'+suc+'"';
-        query.Open();
-        if not query.IsEmpty() then begin
-            result := query.FieldByName('param1').AsFloat/100;
-            Exit;
-        end;
-
-        query.Sql.Text :=
-            'SELECT param1 '+
-            'FROM EVALUA_reglas_capacidad '+
-            'WHERE '+
-                    'tipo_regla = "INGRESO_MENSUAL" AND '+
-                    'sucursal = "*"';
-        query.Open();
-        if not query.IsEmpty() then begin
-            result := query.FieldByName('param1').AsFloat/100;
-            Exit;
-        end;
-
-        result := 0.30;
-    end;
-    function obtenerTasaInteresAnualizada(suc : String; query : TZMySqlQuery) : Double;
-    begin
-        query.Sql.Text :=
-            'SELECT param1 '+
-            'FROM EVALUA_reglas_capacidad '+
-            'WHERE '+
-                    'tipo_regla = "TASA_INTERES" AND '+
-                    'sucursal = "'+suc+'"';
-        query.Open();
-        if not query.IsEmpty() then begin
-            result := query.FieldByName('param1').AsFloat/100;
-            Exit;
-        end;
-
-        query.Sql.Text :=
-            'SELECT param1 '+
-            'FROM EVALUA_reglas_capacidad '+
-            'WHERE '+
-                    'tipo_regla = "TASA_INTERES" AND '+
-                    'sucursal = "*"';
-        query.Open();
-        if not query.IsEmpty() then begin
-            result := query.FieldByName('param1').AsFloat/100;
-            Exit;
-        end;
-
-        result := 0.60;
-    end;
-    function obtenerEdad(fechaActual : TDate): Integer;
-    begin
-        result := YearsBetween(fechaActual,deNacimiento_Cliente.Date);
-    end;
-    function tieneHit(cuenta : String; ver : String; query : TZMySqlQuery): Boolean;
-    begin
-        query.Sql.Text :=
-            'SELECT COUNT(clave_cuenta) AS cantidad '+
-            'FROM EVALUA_segmento_TL '+
-            'WHERE '+
-                    'clave_cuenta = "'+cuenta+'" AND '+
-                    'version = "'+ver+'"';
-        query.Open();
-        result := query.FieldByName('cantidad').AsInteger > 0;
-    end;
-    function obtenerPagosMensuales(cuenta : String; ver : String; query : TZMySqlQuery): Double;
-    var
-    totalPagos : Double;
-    frecPago : String;
-    montoPagar : Double;
-    saldoActual : Double;
-    tmp : String;
-    begin
-        totalPagos := 0;
-        query.Sql.Text :=
-            'SELECT '+
-                    'TL22 AS saldo_actual,'+
-                    'TL12 AS monto_pagar,'+
-                    'TL11 AS frecuencia_pagos '+
-            'FROM EVALUA_segmento_TL '+
-            'WHERE '+
-                    'clave_cuenta = "'+cuenta+'" AND '+
-                    'version = "'+ver+'"';
-        query.Open();
-        while not query.Eof do begin
-            tmp := Trim(query.FieldByName('saldo_actual').AsString);
-            if tmp = '' then begin
-                saldoActual := 0
-            end else begin
-                tmp := StringReplace(tmp,'$','',[rfReplaceAll]);
-                tmp := StringReplace(tmp,'+','',[rfReplaceAll]);
-                saldoActual := StrToInt(tmp);
-            end;
-            if saldoActual <= 0 then begin
-                query.Next();
-                Continue;
-            end;
-            montoPagar := query.FieldByName('monto_pagar').AsFloat;
-            frecPago := Trim(query.FieldByName('frecuencia_pagos').AsString);
-            if frecPago = 'B' then begin //BIMESTRAL
-                montoPagar := montoPagar / 2;
-            end else if frecPago = 'D' then begin //DIARIO
-                montoPagar := montoPagar * 30.4;
-            end else if frecPago = 'H' then begin //SEMESTRAL
-                montoPagar := montoPagar / 6;
-            end else if frecPago = 'K' then begin //CATORCENAL
-                montoPagar := (montoPagar/28) * 30.4;
-            end else if frecPago = 'M' then begin //MENSUAL
-                montoPagar := montoPagar;
-            end else if frecPago = 'P' then begin //DEDUCCION DEL SALARIO
-                MessageDlg(
-                    'SE HA DETECTADO UNA CUENTA CON FORMA DE PAGO:'+#13+
-                    '"P" (DEDUCCIÓN DEL SALARIO), SE IGNORARÁ EN EL CÁLCULO', mtWarning, [mbOK], 0);
-                query.Next();
-                Continue;
-            end else if frecPago = 'Q' then begin //TRIMESTRAL
-                montoPagar := montoPagar / 3;
-            end else if frecPago = 'S' then begin //QUINCENAL
-                montoPagar := montoPagar * 2;
-            end else if frecPago = 'V' then begin //VARIABLE
-                MessageDlg(
-                    'SE HA DETECTADO UNA CUENTA CON FORMA DE PAGO:'+#13+
-                    '"V" (VARIABLE), SE IGNORARÁ EN EL CÁLCULO', mtWarning, [mbOK], 0);
-                query.Next();
-                Continue;
-            end else if frecPago = 'W' then begin //SEMANAL
-                montoPagar := (montoPagar/7) * 30.4;
-            end else if frecPago = 'Y' then begin //ANUAL
-                montoPagar := montoPagar/12;
-            end else if frecPago = 'Z' then begin //PAGO MINIMO PARA CUENTAS REVOLVENTES
-                MessageDlg(
-                    'SE HA DETECTADO UNA CUENTA CON FORMA DE PAGO:'+#13+
-                    '"Z" (PAGO MÍNIMO), SE IGNORARÁ EN EL CÁLCULO', mtWarning, [mbOK], 0);
-                query.Next();
-                Continue;
-            end;
-
-            if saldoActual < montoPagar then
-                totalPagos := totalPagos + saldoActual
-            else
-                totalPagos := totalPagos + montoPagar;
-            query.Next();
-        end;
-        result := totalPagos;
-    end;
-begin
-    claveCuenta := Trim(txtClave_Cuenta.Text);
-    // Verificar si se han realizado consultas previas al buro de
-    // credito (los resultados de estas consultas se almacenan en las
-    // tablas que inician con "EVALUA_"
-    dmModulo_datos.msqTemporal.Sql.Text :=
-        'SELECT clave_cuenta '+
-        'FROM corporativo.EVALUA_segmento_PN '+
-        'WHERE clave_cuenta = "'+claveCuenta+'"';
-    dmModulo_datos.msqTemporal.Open();
-    if dmModulo_datos.msqTemporal.IsEmpty() then begin
-        ButtonResultadoBuro.Enabled := False;
-        ButtonRecalcular.Enabled := True;
-    end else begin
-        ButtonResultadoBuro.Enabled := True;
-
-        sucursal := obtenerSucursal(claveCuenta, dmModulo_datos.msqTemporal);
-        tasaInteresAnual := obtenerTasaInteresAnualizada(sucursal, dmModulo_datos.msqTemporal);
-        porcentajeIngresoMensual := obtenerPorcentajeIngresoMensual(sucursal, dmModulo_datos.msqTemporal);
-        ingresoMensual := obtenerIngresoMensual();
-        edad := obtenerEdad(frmMain.dFecha_server);
-
-        version := obtenerVersion(claveCuenta, dmModulo_datos.msqTemporal);
-        score := obtenerScore(claveCuenta, version, dmModulo_datos.msqTemporal);
-
-        // por lo general la variable "pagoMensualDeCliente" contiene el valor
-        // -1, a menos que se haya especificado un monto diferente utilizando
-        // para ello el boton ButtonRecalcular (Re-calcular)
-        if pagoMensualDeCliente = -1 then
-            pagosMensualesIB := obtenerPagosMensuales(claveCuenta, version, dmModulo_datos.msqTemporal)
-        else
-            pagosMensualesIB := pagoMensualDeCliente;
-        hit := tieneHit(claveCuenta, version, dmModulo_datos.msqTemporal);
-
-        montoMaximo := 0;
-        resultado := '';
-
-        if score < 0 then begin
-            if hit or (edad > 22) then begin
-                negativoObtenerMontoYResultado(sucursal, 22, montoMaximo, resultado, dmModulo_datos.msqTemporal)
-            end else if hit and (edad < 23) then begin
-                negativoObtenerMontoYResultado(sucursal, 23, montoMaximo, resultado, dmModulo_datos.msqTemporal)
-            end;
-        end else begin
-            rangoObtenerMontoYResultado(sucursal, score, montoMaximo, resultado, dmModulo_datos.msqTemporal);
-        end;
-
-        riesgo := (montoMaximo*(1+tasaInteresAnual))/24;
-        financiero := ((ingresoMensual*porcentajeIngresoMensual) - pagosMensualesIB)/2;
-
-        if riesgo < financiero then
-            capacidadPago := riesgo
-        else
-            capacidadPago := financiero;
-
-        if capacidadPago <= 0 then
-            resultado := 'RECHAZADO';
-
-        mostrarCapacidadDePago(capacidadPago, resultado, score);
-
-        ButtonRecalcular.Enabled := True;
-
-        fgResumen.Enabled := iNivel >= 3;
-
-        if hit then
-            textoHit := 'Si'
-        else
-            textoHit := 'No';
-        MessageDlg(
-            'VENTANA PARA VALIDACION DE MODULO'+#13+#13+
-            'tasa de interes anual: '+FloatToStr(tasaInteresAnual)+#13+
-            'porcentaje de ingreso mensual: '+FloattoStr(porcentajeIngresoMensual)+#13+
-            'score: '+IntToStr(score)+#13+
-            'edad: '+IntToStr(edad)+#13+
-            'ingreso mensual: '+FloatToStr(ingresoMensual)+#13+
-            'pagos mensuales ib: '+FloatToStr(pagosMensualesIB)+#13+
-            'hit: '+textoHit+#13+
-            'riesgo: '+FloatToStr(riesgo)+#13+
-            'financiero: '+FloatToStr(financiero)
-            , mtInformation, [mbOK], 0);
-    end;
-end;
 
 procedure TfrmScoreCard.ButtonResultadoBuroClick(Sender: TObject);
 var
